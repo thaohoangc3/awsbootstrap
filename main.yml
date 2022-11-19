@@ -6,6 +6,23 @@ Parameters:
   EC2AMI:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  CodePipelineBucket:
+    Type: String
+    Description: 'The S3 Bucket for CodePipeline artifacts'
+  GithubOwner:
+    Type: String
+    Description: 'The username of the source Github repo'
+  GithubRepo:
+    Type: String
+    Description: 'The source Github repo name (without the username)'
+  GithubBranch:
+    Type: String
+    Default: master
+    Description: 'The source Github branch'
+  GitHubPersonalAccessToken:
+    Type: String
+    NoEcho: true
+    Description: 'A Github personal access token with "repo" and "admin:repo_hook" permission'
 
 Resources:
   SecurityGroup:
@@ -24,9 +41,23 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
-
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - codepipeline.amazonaws.com
+              - codedeploy.amazonaws.com
+              - codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
   InstanceRole:
-    Type: "AWS::IAM::Role"
+    Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -38,9 +69,104 @@ Resources:
           Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      ServiceRole: !GetAtt DeploymentRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:2.0
+      Source:
+        Type: CODEPIPELINE
+  DeploymentApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref AWS::StackName
+      ComputePlatform: Server
+  StagingDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: Instance
+    Properties:
+      DeploymentGroupName: staging
+      ApplicationName: !Ref DeploymentApplication
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      ServiceRoleArn: !GetAtt DeploymentRole.Arn
+      Ec2TagFilters:
+        - Key: aws:cloudformation:stack-name
+          Type: KEY_AND_VALUE
+          Value: !Ref AWS::StackName
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      ArtifactStore:
+        Location: !Ref CodePipelineBucket
+        Type: S3
+      RoleArn: !GetAtt DeploymentRole.Arn
+      Stages:
+        - Name: Source
+          ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Version: 1
+            Provider: GitHub
+          OutputArtifacts:
+            - Name: Source
+          Configuration:
+            Owner: !Ref GithubOwner
+            Repo: !Ref GithubRepo
+            Branch: !Ref GithubBranch
+            OAuthToken: !Ref GitHubPersonalAccessToken
+            PollForSourceChanges: false
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Build
+              Configuration:
+                ProjectName: !Ref BuildProject
+              RunOrder: 1
+        - Name: Staging
+          InputArtifacts:
+            - Name: Build
+          ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CodeDeploy
+          Configuration:
+            ApplicationName: !Ref DeploymentApplication
+            DeploymentGroupName: !Ref StagingDeploymentGroup
+          RunOrder: 1
+  PipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubPersonalAccessToken
+      Filters:
+        - JsonPath: $.ref
+          MatchEquals: 'refs/head/{Branch}'
+      TargetPipeline: !Ref Pipeline
+      TargetAction: Source
+      Name: !Sub 'webhook-${AWS::StackName}'
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      RegisterWithThirdParty: true
   InstanceProfile:
     Type: "AWS::IAM::InstanceProfile"
     Properties:
@@ -58,8 +184,15 @@ Resources:
         config:
           packages:
             yum:
-              wget: []
-              unzip: []
+              ruby: []
+          files:
+            /home/ec2-user/install:
+              source: !Sub "https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install"
+              mode: "000755"
+          commands:
+            00-install-cd-agent:
+              command: "./install auto"
+              cwd: /home-ec2-user
     Properties:
       ImageId: !Ref EC2AMI
       InstanceType: !Ref EC2InstanceType
@@ -72,31 +205,30 @@ Resources:
           #!/bin/bash -xe
           # send script output to /tmp so we can debug boot failures
           exec > /tmp/userdata.log 2>&1
-
+          # Update all packages
           yum -y update
-          # Get latest cfn scripts:
+          # Get latest cfn scripts; https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best- practices.html#cfninit
           yum install -y aws-cfn-bootstrap
+          cat > /tmp/install_script.sh << EOF
+            # START
+            echo "Setting up NodeJS Environment"
+            curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
+            # Dot source the files to ensure that variables are available within the current shell
+            . /home/ec2-user/.nvm/nvm.sh
+            . /home/ec2-user/.bashrc
+            # Install NVM, NPM, Node.JS
+            nvm alias default v16.18.0
+            nvm install v16.18.0
+            nvm use v16.18.0
+            # Create log directory
+            mkdir -p /home/ec2-user/app/logs
+          EOF
+          chown ec2-user:ec2-user /tmp/install_script.sh && chmod a+x
+          /tmp/install_script.sh
+          sleep 1; su - ec2-user -c "/tmp/install_script.sh"
           # Have CloudFormation install any files and packages from the metadata
           /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
-          cat > /tmp/install_script.sh << EOF
-          echo "Setting up NodeJS Environment"
-          curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
-          . /home/ec2-user/.nvm/nvm.sh
-          . /home/ec2-user/.bashrc
-          nvm alias default v16.18.0
-          nvm install v16.18.0
-          nvm use v16.18.0
-          wget https://github.com/thaohoangc3/awsbootstrap/archive/master.zip
-          unzip master.zip
-          mv awsbootstrap-master app
-          mkdir -p /home/ec2-user/app/logs
-          cd app
-          npm install
-          npm start
-          EOF
-          chown ec2-user:ec2-user  /tmp/install_script.sh && chmod a+x /tmp/install_script.sh
-          sleep 1; su - ec2-user -c "/tmp/install_script.sh"
-          # Signal to CloudFormation that the isntance is ready
+          # Signal to CloudFormation that the instance is ready
           /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
       Tags:
         - Key: Name${STACK_NAME}-PublicIP
